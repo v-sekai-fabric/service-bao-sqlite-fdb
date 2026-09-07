@@ -40,7 +40,7 @@ type backend struct {
 	fabric  bool
 	dir     string
 	mu      sync.Mutex
-	named   map[string]Store
+	stores  map[string]Store
 }
 
 type storeConfig struct {
@@ -82,7 +82,7 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 		catalog: catalog,
 		fabric:  cfg.cluster != "",
 		dir:     cfg.dir,
-		named:   map[string]Store{},
+		stores:  map[string]Store{},
 	}
 	if b.fabric {
 		if err := StartFabricStore(cfg.cluster); err != nil {
@@ -155,7 +155,7 @@ func (b *backend) named(ctx context.Context, name string) (Store, error) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if s, ok := b.named[name]; ok {
+	if s, ok := b.stores[name]; ok {
 		return s, nil
 	}
 	var s Store
@@ -175,7 +175,7 @@ func (b *backend) named(ctx context.Context, name string) (Store, error) {
 		_ = s.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	b.named[name] = s
+	b.stores[name] = s
 	return s, nil
 }
 
@@ -183,11 +183,11 @@ func (b *backend) clean(_ context.Context) { b.stop() }
 
 func (b *backend) stop() {
 	b.mu.Lock()
-	for name, s := range b.named {
+	for name, s := range b.stores {
 		if err := s.Close(); err != nil {
 			b.warn("store close", "db", name, "error", err)
 		}
-		delete(b.named, name)
+		delete(b.stores, name)
 	}
 	b.mu.Unlock()
 	if b.store != nil {
