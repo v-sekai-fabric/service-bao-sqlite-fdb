@@ -38,14 +38,16 @@ One process, no IPC. The plugin binary contains the openbao SDK glue, the SQLite
 
 ## What it does
 
-- Serves `<mount>/query/<name>` — reads run one precanned SQL statement and return its rows.
-- Serves `<mount>/queries` — lists registered query names.
-- Rejects arbitrary SQL. Only queries defined in the startup catalog run.
+- Serves `<mount>/query/<name>` — reads run one precanned SQL statement on the default database and return its rows.
+- Serves `<mount>/query/<db>/<name>` and `<mount>/exec/<db>/<name>` — the same statements on a named database opened on demand; `exec` runs a registered write (`bao write`) and returns its rows and change count.
+- Serves `<mount>/queries` and `<mount>/execs` — list the registered names.
+- Applies the catalog's `schema` blocks when it opens a named database, and in fabric mode the open takes the database's fence.
+- Rejects arbitrary SQL. Only statements defined in the startup catalog run, and a name is either a query or an exec, never both.
 
 ## What it does not do
 
 - Rotate credentials, mint short-lived tokens, or manage a role / lease lifecycle.
-- Accept DDL or DML at request time.
+- Accept SQL at request time. DDL lives in `schema` blocks and DML in `exec` blocks, both in the catalog.
 - Cache to Bao's own storage backend. Every read hits SQLite live.
 
 ## Configuration
@@ -56,10 +58,11 @@ Environment variables read at plugin startup. Unmet preconditions fail startup r
 |---|---|---|
 | `BAO_SQLITE_FDB_CATALOG` | always | Path to the HCL catalog file. See `catalog.example.hcl`. |
 | `BAO_SQLITE_FDB_CLUSTER` | fabric mode | Path to the FoundationDB cluster file, passed to `weft_fdb_start`. |
-| `BAO_SQLITE_FDB_DB` | fabric mode | Actor / database name (becomes `weft/db/<name>/` in the FDB key space). |
-| `BAO_SQLITE_FDB_DSN` | plain mode | Plain SQLite DSN (filesystem path or `:memory:`). For dev and tests. |
+| `BAO_SQLITE_FDB_DB` | fabric mode, optional | Default database behind `query/<name>` (becomes `weft/db/<name>/` in the FDB key space). Named databases open on demand under the same key space. |
+| `BAO_SQLITE_FDB_DSN` | plain mode | Plain SQLite DSN for the default database (filesystem path or `:memory:`). For dev and tests. |
+| `BAO_SQLITE_FDB_DIR` | plain mode | Directory for named databases, one `<name>.sqlite` file each. For dev and tests. |
 
-Exactly one mode. Fabric mode needs both `CLUSTER` and `DB`; plain mode needs `DSN`. Setting variables from both modes fails startup.
+Exactly one mode. Fabric mode needs `CLUSTER`; plain mode needs `DSN` and/or `DIR`. Setting variables from both modes fails startup. A database name is one path segment of `[A-Za-z0-9_-]`.
 
 ## Catalog shape
 
@@ -68,7 +71,16 @@ Exactly one mode. Fabric mode needs both `CLUSTER` and `DB`; plain mode needs `D
       args = ["lang"]
     }
 
-`args` names bind positionally from the request data map in order. Duplicate names, missing `sql`, and unnamed queries are rejected at load.
+    exec "append_event" {
+      sql  = "INSERT INTO events (at, text) VALUES (?, ?) RETURNING ordinal"
+      args = ["at", "text"]
+    }
+
+    schema "events_*" {
+      file = "events.sql"
+    }
+
+`args` names bind positionally from the request data map in order. Duplicate names, missing `sql`, and unnamed statements are rejected at load, and so is a name that is both a `query` and an `exec`. A `schema` block's label is a database name or a prefix ending in `*`; it carries `sql` or a `file` relative to the catalog, split into statements on `;`, and runs when that database is opened (the exact label wins over the longest prefix).
 
 ## Build
 
