@@ -37,6 +37,8 @@ func init() {
 
 type Store interface {
 	Query(ctx context.Context, sqlText string, args ...interface{}) ([]map[string]interface{}, error)
+	Exec(ctx context.Context, sqlText string, args ...interface{}) ([]map[string]interface{}, int64, error)
+	Apply(ctx context.Context, statements []string) error
 	Close() error
 }
 
@@ -57,11 +59,14 @@ func OpenFabricStore(dbName string) (Store, error) {
 	return openWith(driverFabric, dsn)
 }
 
+// One connection per database: a weft_fdb database has one writer and holds
+// locking_mode=EXCLUSIVE, so a pool would only queue behind itself.
 func openWith(driver, dsn string) (Store, error) {
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping %s: %w", dsn, err)
@@ -74,13 +79,53 @@ func (s *sqlStore) Query(ctx context.Context, sqlText string, args ...interface{
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return collect(rows)
+}
 
+// Exec runs one statement on a pinned connection so the change count read
+// afterwards belongs to it; RETURNING rows come back like a query's.
+func (s *sqlStore) Exec(ctx context.Context, sqlText string, args ...interface{}) ([]map[string]interface{}, int64, error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer conn.Close()
+
+	rows, err := conn.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	out, err := collect(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	var changes int64
+	if err := conn.QueryRowContext(ctx, "SELECT changes()").Scan(&changes); err != nil {
+		return nil, 0, err
+	}
+	return out, changes, nil
+}
+
+func (s *sqlStore) Apply(ctx context.Context, statements []string) error {
+	for _, st := range statements {
+		if _, err := s.db.ExecContext(ctx, st); err != nil {
+			return fmt.Errorf("%s: %w", st, err)
+		}
+	}
+	return nil
+}
+
+func (s *sqlStore) Close() error { return s.db.Close() }
+
+// collect reads every row into a column-keyed map and closes the cursor. An
+// empty result is an empty list, never null.
+func collect(rows *sql.Rows) ([]map[string]interface{}, error) {
+	defer rows.Close()
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
 	}
-	var out []map[string]interface{}
+	out := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		cells := make([]interface{}, len(cols))
 		ptrs := make([]interface{}, len(cols))
@@ -98,5 +143,3 @@ func (s *sqlStore) Query(ctx context.Context, sqlText string, args ...interface{
 	}
 	return out, rows.Err()
 }
-
-func (s *sqlStore) Close() error { return s.db.Close() }
